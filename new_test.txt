@@ -1,0 +1,97 @@
+import spotipy
+from spotipy.oauth2 import SpotifyPKCE
+import base64
+import requests
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+# Define Spotify Client Credentials
+SPOTIFY_CLIENT_ID = ""
+SPOTIFY_REDIRECT_URI = "http://localhost:8080/callback/"
+
+# Configure common retry decorator for API calls
+@retry(wait=wait_fixed(30), stop=stop_after_attempt(3))
+def execute_with_retry(func, *args, **kwargs):
+    """Wrapper to execute Spotify API calls with retries on failure."""
+    return func(*args, **kwargs)
+
+# Context manager for Spotify API setup
+def spotify_client(scope):
+    """Create a Spotify client with the specified scope."""
+    return spotipy.Spotify(auth_manager=SpotifyPKCE(client_id=SPOTIFY_CLIENT_ID, redirect_uri=SPOTIFY_REDIRECT_URI, scope=scope))
+
+def fetch_all_items(client_func):
+    """Fetch all items across paginated Spotify API responses."""
+    items = []
+    response = client_func()
+    items.extend(response['items'])
+    while response['next']:
+        response = execute_with_retry(client_func)
+        items.extend(response['items'])
+    return items
+
+def download_user_data():
+    """Download playlists and saved tracks from the origin account."""
+    print("Logging into Origin account")
+    with spotify_client("user-library-read") as origin_spotify:
+        print("\n\nOrigin account:", origin_spotify.me()['display_name'])
+
+        # Fetch Playlists
+        print("Fetching playlists...")
+        origin_playlists = fetch_all_items(origin_spotify.current_user_playlists)
+        for playlist in origin_playlists:
+            playlist_tracks = fetch_all_items(lambda: origin_spotify.playlist_tracks(playlist['id']))
+            playlist['track_uris'] = [track['track']['uri'] for track in playlist_tracks]
+
+        # Fetch Saved Tracks
+        print("Fetching saved tracks...")
+        saved_tracks_uris = [track['track']['id'] for track in fetch_all_items(origin_spotify.current_user_saved_tracks)]
+        
+        return origin_playlists, saved_tracks_uris
+
+def transfer_user_data(playlists_data, saved_tracks_uris):
+    """Upload playlists and saved tracks to the destination account."""
+    print("Logging into Destination account")
+    with spotify_client("playlist-modify-public playlist-modify-private ugc-image-upload user-library-modify") as destination_spotify:
+        print("\n\nDestination account:", destination_spotify.me()['display_name'])
+
+        # Upload Playlists
+        print("Uploading playlists...")
+        for playlist in playlists_data:
+            if playlist.get('track_uris'):
+                # Create and set up new playlist
+                new_playlist = execute_with_retry(
+                    destination_spotify.user_playlist_create,
+                    destination_spotify.me()['id'],
+                    playlist['name'],
+                    public=playlist['public'],
+                    collaborative=playlist['collaborative'],
+                    description=playlist.get('description')
+                )
+                print(f"Created playlist: {playlist['name']} with ID: {new_playlist['id']}")
+
+                # Set cover image if exists
+                if playlist['images']:
+                    cover_image_b64 = base64.b64encode(requests.get(playlist['images'][0]['url']).content)
+                    try:
+                        execute_with_retry(destination_spotify.playlist_upload_cover_image, new_playlist['id'], cover_image_b64)
+                        print(f"Uploaded cover image for playlist: {playlist['name']}")
+                    except Exception as e:
+                        print(f"Error uploading cover image for \"{playlist['name']}\"; skipping... ({str(e)})")
+
+                # Add tracks to new playlist in chunks
+                track_chunks = chunk_list(playlist['track_uris'], 49)
+                for track_chunk in track_chunks:
+                    print(f"Adding {len(track_chunk)} tracks to playlist: {playlist['name']}")
+                    execute_with_retry(destination_spotify.playlist_add_items, new_playlist['id'], track_chunk)
+            else:
+                print(f"Playlist \"{playlist['name']}\" has no tracks; skipping...")
+
+        # Upload Saved Tracks
+        print("Uploading saved tracks...")
+        track_chunks = chunk_list(saved_tracks_uris, 49)
+        for track_chunk in track_chunks:
+            execute_with_retry(destination_spotify.current_user_saved_tracks_add, track_chunk)
+
+def chunk_list(items, chunk_size):
+    """Utility to split a list into chunks of a specified size."""
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
